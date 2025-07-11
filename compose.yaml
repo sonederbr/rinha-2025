@@ -1,0 +1,7 @@
+﻿services:
+  processorapi:
+    image: processorapi
+    build:
+      context: .
+      dockerfile: src/ProcessorApi/Dockerfile
+

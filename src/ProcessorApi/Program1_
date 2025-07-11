@@ -1,0 +1,187 @@
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+var paymentProcessorDefaultUrl = builder.Configuration["PAYMENT_PROCESSOR_URL_DEFAULT"];
+var paymentProcessorFallbackUrl = builder.Configuration["PAYMENT_PROCESSOR_URL_FALLBACK"];
+
+var paymentQueue = new Queue<PaymentRequest>();
+var responseQueue = new Queue<PaymentResponse>();
+var defaultProcessorHealth = new PaymentProcessorHealth();
+var fallbackProcessorHealth = new PaymentProcessorHealth();
+
+var healthCheckInterval = TimeSpan.FromSeconds(5);
+
+// Start health check threads
+new Thread(() => MonitorProcessorHealth(paymentProcessorDefaultUrl, defaultProcessorHealth, healthCheckInterval)).Start();
+new Thread(() => MonitorProcessorHealth(paymentProcessorFallbackUrl, fallbackProcessorHealth, healthCheckInterval)).Start();
+
+// Start payment processing threads
+for (int i = 0; i < 5; i++) // Adjust thread count as needed
+{
+    new Thread(() => ProcessPayments(paymentProcessorDefaultUrl, paymentProcessorFallbackUrl, paymentQueue, responseQueue, defaultProcessorHealth, fallbackProcessorHealth)).Start();
+}
+
+app.MapPost("/payments", async (PaymentRequest payment) =>
+{
+    if (string.IsNullOrEmpty(payment.CorrelationId) || payment.Amount <= 0)
+    {
+        return Results.BadRequest("Invalid payment request.");
+    }
+
+    lock (paymentQueue)
+    {
+        paymentQueue.Enqueue(payment);
+    }
+
+    PaymentResponse paymentResponse = null;
+    var timeout = TimeSpan.FromSeconds(10); // Adjust timeout as needed
+    var startTime = DateTime.UtcNow;
+
+    while (DateTime.UtcNow - startTime < timeout)
+    {
+        lock (responseQueue)
+        {
+            paymentResponse = responseQueue.FirstOrDefault(r => r.CorrelationId == payment.CorrelationId);
+            if (paymentResponse != null)
+            {
+                responseQueue.Dequeue(); // Remove the processed response from the queue
+                break;
+            }
+        }
+
+        await Task.Delay(100); // Polling interval
+    }
+
+    if (paymentResponse == null)
+    {
+        return Results.StatusCode(504, "Payment processing timed out.");
+    }
+
+    return paymentResponse.Success
+        ? Results.Ok(new { Message = "Payment processed successfully." })
+        : Results.StatusCode(503, "Payment processing failed.");
+});
+
+app.MapGet("/payments-summary", async (HttpRequest req) =>
+{
+    var from = req.Query["from"];
+    var to = req.Query["to"];
+
+    // Fetch summary logic here
+    // Placeholder for summary logic
+
+    return Results.Ok(new
+    {
+        Default = new PaymentSummary(),
+        Fallback = new PaymentSummary()
+    });
+});
+
+app.Run();
+
+void MonitorProcessorHealth(string processorUrl, PaymentProcessorHealth health, TimeSpan interval)
+{
+    var httpClient = new HttpClient();
+    while (true)
+    {
+        try
+        {
+            var response = httpClient.GetFromJsonAsync<ServiceHealth>($"{processorUrl}/payments/service-health").Result;
+            if (response != null)
+            {
+                lock (health)
+                {
+                    health.IsHealthy = !response.Failing;
+                    health.MinResponseTime = response.MinResponseTime;
+                }
+            }
+        }
+        catch
+        {
+            lock (health)
+            {
+                health.IsHealthy = false;
+            }
+        }
+        Thread.Sleep(interval);
+    }
+}
+
+void ProcessPayments(string defaultUrl, string fallbackUrl, Queue<PaymentRequest> paymentQueue, Queue<PaymentResponse> responseQueue, PaymentProcessorHealth defaultHealth, PaymentProcessorHealth fallbackHealth)
+{
+    var httpClient = new HttpClient();
+    while (true)
+    {
+        PaymentRequest payment = null;
+        lock (paymentQueue)
+        {
+            if (paymentQueue.Count > 0)
+            {
+                payment = paymentQueue.Dequeue();
+            }
+        }
+
+        if (payment != null)
+        {
+            string targetUrl = null;
+            lock (defaultHealth)
+            {
+                if (defaultHealth.IsHealthy)
+                {
+                    targetUrl = defaultUrl;
+                }
+            }
+
+            if (targetUrl == null)
+            {
+                lock (fallbackHealth)
+                {
+                    if (fallbackHealth.IsHealthy)
+                    {
+                        targetUrl = fallbackUrl;
+                    }
+                }
+            }
+
+            if (targetUrl != null)
+            {
+                var requestBody = new
+                {
+                    payment.CorrelationId,
+                    payment.Amount,
+                    RequestedAt = DateTime.UtcNow.ToString("o")
+                };
+
+                try
+                {
+                    var response = httpClient.PostAsJsonAsync($"{targetUrl}/payments", requestBody).Result;
+                    if (response.IsSuccessStatusCode)
+                    {
+                        lock (responseQueue)
+                        {
+                            responseQueue.Enqueue(new PaymentResponse(payment.CorrelationId, true));
+                        }
+                    }
+                }
+                catch
+                {
+                    lock (responseQueue)
+                    {
+                        responseQueue.Enqueue(new PaymentResponse(payment.CorrelationId, false));
+                    }
+                }
+            }
+        }
+    }
+}
+
+record PaymentRequest(string CorrelationId, decimal Amount);
+record PaymentResponse(string CorrelationId, bool Success);
+record ServiceHealth(bool Failing, int MinResponseTime);
+record PaymentSummary(int TotalRequests = 0, decimal TotalAmount = 0.0m);
+
+class PaymentProcessorHealth
+{
+    public bool IsHealthy { get; set; }
+    public int MinResponseTime { get; set; }
+}

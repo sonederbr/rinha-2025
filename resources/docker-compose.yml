@@ -1,0 +1,26 @@
+version: '3.9'
+
+services:
+  backend:
+    build: .
+    image: rinha-backend:latest
+    ports:
+      - "9999:9999"
+    networks:
+      - backend
+      - payment-processor
+    environment:
+      - PAYMENT_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080
+      - PAYMENT_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: "175MB"
+    replicas: 2
+
+networks:
+  backend:
+    driver: bridge
+  payment-processor:
+    external: true
