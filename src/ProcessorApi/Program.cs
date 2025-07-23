@@ -31,6 +31,9 @@ var responseDictionary = new ConcurrentDictionary<string, TaskCompletionSource<P
 var defaultProcessorHealth = new PaymentProcessorHealth();
 var fallbackProcessorHealth = new PaymentProcessorHealth();
 
+var paymentsDefault = new List<PaymentResponse>();
+var paymentsFallback = new List<PaymentResponse>();
+
 // Start health check threads
 var healthCheckInterval = TimeSpan.FromSeconds(5);
 var processorHealth = app.Services.GetRequiredService<MonitorProcessor>();
@@ -52,7 +55,9 @@ for (var i = 0; i < processorCount; i++)
                 payment,
                 responseDictionary,
                 defaultProcessorHealth,
-                fallbackProcessorHealth);
+                fallbackProcessorHealth,
+                paymentsDefault,
+                paymentsFallback);
         }
     });
 }
@@ -80,6 +85,22 @@ app.MapPost("/payments", async (PaymentRequest payment, CancellationToken token 
     }
 
     return Results.StatusCode(504); // "Payment processing timed out."
+});
+
+app.MapGet("/payments-summary", async (HttpRequest req) =>
+{
+    var from = req.Query["from"];
+    var to = req.Query["to"];
+
+    // Fetch summary logic here
+    // Placeholder for summary logic
+
+    return Results.Ok(new
+    {
+        Default = new PaymentSummary() { TotalAmount = paymentsDefault.Sum(p => p.Amount), TotalRequests = paymentsDefault.Count()},
+        Fallback = new PaymentSummary() { TotalAmount = paymentsFallback.Sum(p => p.Amount), TotalRequests =
+            paymentsFallback.Count()}
+    });
 });
 
 // Configure the HTTP request pipeline.

@@ -18,7 +18,9 @@ internal class PaymentProcessor
         PaymentRequest payment,
         ConcurrentDictionary<string, TaskCompletionSource<PaymentResponse>> responses,
         PaymentProcessorHealth defaultHealth,
-        PaymentProcessorHealth fallbackHealth)
+        PaymentProcessorHealth fallbackHealth,
+        List<PaymentResponse> paymentsDefault,
+        List<PaymentResponse> paymentsFallback)
     {
         string? targetUrl = null;
         bool isDefaultUrl = false;
@@ -47,17 +49,22 @@ internal class PaymentProcessor
                 var response = await _httpClient.PostAsJsonAsync($"{targetUrl}/payments", requestBody);
                 if (response.IsSuccessStatusCode)
                 {
+                    var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, true);
                     if (responses.TryRemove(payment.CorrelationId, out var tcs))
-                    {
-                        tcs.SetResult(new PaymentResponse(payment.CorrelationId, true));
-                    }
+                        tcs.SetResult(paymentResponse);
+
+                    if (isDefaultUrl)
+                        paymentsDefault.Add(paymentResponse);
+                    else
+                        paymentsFallback.Add(paymentResponse);
+                    
                     Console.WriteLine($"Payment processed successfully: {payment.CorrelationId} is default url {isDefaultUrl}");
                 }
                 else
                 {
                     if (responses.TryRemove(payment.CorrelationId, out var tcs))
                     {
-                        tcs.SetResult(new PaymentResponse(payment.CorrelationId, false));
+                        tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
                     }
                     Console.WriteLine($"Payment failed: {payment.CorrelationId}");
                 }
@@ -66,7 +73,7 @@ internal class PaymentProcessor
             {
                 if (responses.TryRemove(payment.CorrelationId, out var tcs))
                 {
-                    tcs.SetResult(new PaymentResponse(payment.CorrelationId, false));
+                    tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
                 }
                 Console.WriteLine($"Payment processing error: {payment.CorrelationId}");
                 
@@ -79,7 +86,7 @@ internal class PaymentProcessor
         {
             if (responses.TryRemove(payment.CorrelationId, out var tcs))
             {
-                tcs.SetResult(new PaymentResponse(payment.CorrelationId, false));
+                tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
             }
             Console.WriteLine($"No healthy processor available for payment: {payment.CorrelationId}");
         }
