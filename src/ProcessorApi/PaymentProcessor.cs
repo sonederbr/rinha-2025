@@ -1,20 +1,12 @@
 using System.Collections.Concurrent;
-using System.Net.Http.Json;
+using System.Net;
+using Polly;
 
 namespace ProcessorApi;
 
-internal class PaymentProcessor
+public class PaymentProcessor(IHttpClientFactory httpClientFactory)
 {
-    private readonly HttpClient _httpClient;
-
-    public PaymentProcessor(HttpClient httpClient)
-    {
-        _httpClient = httpClient;
-    }
-
     internal async Task ProcessPaymentsAsync(
-        string defaultUrl,
-        string fallbackUrl,
         PaymentRequest payment,
         ConcurrentDictionary<string, TaskCompletionSource<PaymentResponse>> responses,
         PaymentProcessorHealth defaultHealth,
@@ -22,73 +14,94 @@ internal class PaymentProcessor
         List<PaymentResponse> paymentsDefault,
         List<PaymentResponse> paymentsFallback)
     {
-        string? targetUrl = null;
-        bool isDefaultUrl = false;
-        // Determine the target URL based on health status
-        if (defaultHealth.IsHealthy)
-        {
-            targetUrl = defaultUrl;
-            isDefaultUrl = true;
-        }
-        else if (fallbackHealth.IsHealthy)
-        {
-            targetUrl = fallbackUrl;
-        }
+        var isDefaultHealthy = defaultHealth.IsHealthy;
+        var isFallbackHealthy = fallbackHealth.IsHealthy;
+        // Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
+        // if (!isDefaultHealthy && !isFallbackHealthy)
+        // {
+        //     await Task.Delay(2000);
+        //     isDefaultHealthy = defaultHealth.IsHealthy;
+        //     isFallbackHealthy = fallbackHealth.IsHealthy;
+        //     Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
+        //     if (!isDefaultHealthy && !isFallbackHealthy)
+        //     {
+        //         await Task.Delay(2000);
+        //         isDefaultHealthy = defaultHealth.IsHealthy;
+        //         isFallbackHealthy = fallbackHealth.IsHealthy;
+        //         Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
+        //         if (!isDefaultHealthy && !isFallbackHealthy)
+        //         {
+        //             await Task.Delay(1000);
+        //             isDefaultHealthy = defaultHealth.IsHealthy;
+        //             Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
+        //         }
+        //     }
+        // }
 
-        if (targetUrl != null)
+        var httpClient = isDefaultHealthy
+            ? httpClientFactory.CreateClient(Constants.DefaultClient)
+            : httpClientFactory.CreateClient(Constants.FallbackClient);
+
+        var retryPolicy = Policy
+            .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
+            .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
+
+        var response = await retryPolicy.ExecuteAsync(() => httpClient.PostAsJsonAsync("/payments", new
         {
-            var requestBody = new
+            payment.CorrelationId,
+            payment.Amount,
+            RequestedAt = DateTime.UtcNow.ToString("o")
+        }));
+        
+        // try
+        // {
+        //     var response2 = await retryPolicy.ExecuteAsync(() =>
+        //         httpClient.PostAsJsonAsync("/payments", new
+        //         {
+        //             payment.CorrelationId,
+        //             payment.Amount,
+        //             RequestedAt = DateTime.UtcNow.ToString("o")
+        //         }));
+        //
+        //     if (!response2.IsSuccessStatusCode)
+        //     {
+        //         var errorContent = await response2.Content.ReadAsStringAsync();
+        //         Console.WriteLine($"Request failed: {response2.StatusCode}, Content: {errorContent}");
+        //     }
+        // }
+        // catch (Exception ex)
+        // {
+        //     Console.WriteLine($"Exception occurred: {ex.Message}");
+        // }
+
+        // var response = new HttpResponseMessage(HttpStatusCode.OK);
+        if (response.IsSuccessStatusCode)
+        {
+            var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, true);
+            if (responses.TryRemove(payment.CorrelationId, out var tcs))
+                tcs.SetResult(paymentResponse);
+
+            if (GetClientExecutor(httpClient) == Constants.DefaultClient)
             {
-                payment.CorrelationId,
-                payment.Amount,
-                RequestedAt = DateTime.UtcNow.ToString("o")
-            };
-
-            try
-            {
-                var response = await _httpClient.PostAsJsonAsync($"{targetUrl}/payments", requestBody);
-                if (response.IsSuccessStatusCode)
-                {
-                    var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, true);
-                    if (responses.TryRemove(payment.CorrelationId, out var tcs))
-                        tcs.SetResult(paymentResponse);
-
-                    if (isDefaultUrl)
-                        paymentsDefault.Add(paymentResponse);
-                    else
-                        paymentsFallback.Add(paymentResponse);
-                    
-                    Console.WriteLine($"Payment processed successfully: {payment.CorrelationId} is default url {isDefaultUrl}");
-                }
-                else
-                {
-                    if (responses.TryRemove(payment.CorrelationId, out var tcs))
-                    {
-                        tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
-                    }
-                    Console.WriteLine($"Payment failed: {payment.CorrelationId}");
-                }
+                lock (paymentsDefault)
+                    paymentsDefault.Add(paymentResponse);
+                return;
             }
-            catch
-            {
-                if (responses.TryRemove(payment.CorrelationId, out var tcs))
-                {
-                    tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
-                }
-                Console.WriteLine($"Payment processing error: {payment.CorrelationId}");
-                
-                // Set the url as unhealthy
-                if (isDefaultUrl && defaultHealth.IsHealthy) defaultHealth.IsHealthy = false;
-                if (!isDefaultUrl && fallbackHealth.IsHealthy) fallbackHealth.IsHealthy = false;
-            }
+
+            lock (paymentsFallback)
+                paymentsFallback.Add(paymentResponse);
         }
         else
         {
             if (responses.TryRemove(payment.CorrelationId, out var tcs))
-            {
                 tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
-            }
-            Console.WriteLine($"No healthy processor available for payment: {payment.CorrelationId}");
         }
+    }
+
+    private static string GetClientExecutor(HttpClient httpClient)
+    {
+        return httpClient.DefaultRequestHeaders.TryGetValues(Constants.HeaderClientSourceName, out var values)
+            ? values.First()
+            : string.Empty;
     }
 }

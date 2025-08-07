@@ -77,6 +77,18 @@ app.MapGet("/payments-summary", async (HttpRequest req) =>
     });
 });
 
+
+// var requestBody = new
+    // {
+    //     payment.CorrelationId,
+    //     payment.Amount,
+    //     RequestedAt = DateTime.UtcNow.ToString("o")
+    // };
+    //
+    // var httpClient = new HttpClient();
+    // var result = await httpClient.PostAsJsonAsync($"{paymentProcessorDefaultUrl}/payments", requestBody);
+    // return result.IsSuccessStatusCode ? Results.Ok(new { Message = "Payment processed successfully." }) : Results.StatusCode(503);
+
 app.Run();
 
 void MonitorProcessorHealth(string processorUrl, PaymentProcessorHealth health, TimeSpan interval)
@@ -185,3 +197,24 @@ class PaymentProcessorHealth
     public bool IsHealthy { get; set; }
     public int MinResponseTime { get; set; }
 }
+\\
+// Configure the HTTP request pipeline.
+// if (app.Environment.IsDevelopment())
+//     app.MapOpenApi();
+// app.UseHttpsRedirection();
+
+
+        // }
+        // catch (Exception ex)
+        // {
+        //     if (responses.TryRemove(payment.CorrelationId, out var tcs))
+        //     {
+        //         tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
+        //     }
+        //
+        //     Console.WriteLine($"Payment processing error: {payment.CorrelationId}");
+        //
+        //     // Set the url as unhealthy
+        //     // if (isDefaultUrl && defaultHealth.IsHealthy) defaultHealth.IsHealthy = false;
+        //     // if (!isDefaultUrl && fallbackHealth.IsHealthy) fallbackHealth.IsHealthy = false;
+        // }
