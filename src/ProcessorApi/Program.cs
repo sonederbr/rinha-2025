@@ -13,7 +13,7 @@ builder.Services.AddHttpClient(Constants.DefaultClient, httpClient =>
     {
         httpClient.BaseAddress = new Uri(paymentProcessorDefaultUrl);
         httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.DefaultClient);
-        httpClient.Timeout = TimeSpan.FromSeconds(Constants.TimeoutInSeconds);
+        httpClient.Timeout = TimeSpan.FromSeconds(Constants.HttpClientTimeoutInSeconds);
     })
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
@@ -31,7 +31,7 @@ builder.Services.AddHttpClient(Constants.FallbackClient, httpClient =>
     {
         httpClient.BaseAddress = new Uri(paymentProcessorFallbackUrl);
         httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.FallbackClient);
-        httpClient.Timeout = TimeSpan.FromSeconds(Constants.TimeoutInSeconds);
+        httpClient.Timeout = TimeSpan.FromSeconds(Constants.HttpClientTimeoutInSeconds);
     })
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
@@ -81,7 +81,7 @@ for (var i = 0; i < processorCount; i++)
         paymentsFallback));
 }
 
-await paymentChannel.Writer.WriteAsync(new PaymentRequest(Guid.NewGuid().ToString(), 0.0m));
+// await paymentChannel.Writer.WriteAsync(new PaymentRequest(Guid.NewGuid().ToString(), 0.0m));
 
 var app = builder.Build();
 app.MapPost("/payments", async (PaymentRequest payment, CancellationToken cancellationToken = default) =>
@@ -98,7 +98,7 @@ app.MapPost("/payments", async (PaymentRequest payment, CancellationToken cancel
     await paymentChannel.Writer.WriteAsync(payment, cancellationToken);
 
     var completedTask = await Task.WhenAny(tcs.Task,
-        Task.Delay(TimeSpan.FromSeconds(Constants.TimeoutInSeconds), cancellationToken));
+        Task.Delay(TimeSpan.FromSeconds(Constants.HttpTimeoutInSeconds), cancellationToken));
 
     if (completedTask != tcs.Task || !tcs.Task.IsCompletedSuccessfully)
         return Results.InternalServerError("Payment processing timed out.");

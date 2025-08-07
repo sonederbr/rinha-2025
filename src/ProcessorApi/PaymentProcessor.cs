@@ -38,50 +38,95 @@ public class PaymentProcessor(IHttpClientFactory httpClientFactory)
         //     }
         // }
 
-        var httpClient = isDefaultHealthy
-            ? httpClientFactory.CreateClient(Constants.DefaultClient)
-            : httpClientFactory.CreateClient(Constants.FallbackClient);
+        string usedClient;
 
-        var retryPolicy = Policy
-            .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
-            .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
-
-        var response = await retryPolicy.ExecuteAsync(() => httpClient.PostAsJsonAsync("/payments", new
-        {
-            payment.CorrelationId,
-            payment.Amount,
-            RequestedAt = DateTime.UtcNow.ToString("o")
-        }));
+        var defaultClient = httpClientFactory.CreateClient(Constants.DefaultClient);
+        var fallbackClient = httpClientFactory.CreateClient(Constants.FallbackClient);
         
-        // try
-        // {
-        //     var response2 = await retryPolicy.ExecuteAsync(() =>
-        //         httpClient.PostAsJsonAsync("/payments", new
-        //         {
-        //             payment.CorrelationId,
-        //             payment.Amount,
-        //             RequestedAt = DateTime.UtcNow.ToString("o")
-        //         }));
-        //
-        //     if (!response2.IsSuccessStatusCode)
-        //     {
-        //         var errorContent = await response2.Content.ReadAsStringAsync();
-        //         Console.WriteLine($"Request failed: {response2.StatusCode}, Content: {errorContent}");
-        //     }
-        // }
-        // catch (Exception ex)
-        // {
-        //     Console.WriteLine($"Exception occurred: {ex.Message}");
-        // }
+        var retryPolicy = Policy
+            .Handle<Exception>()
+            .OrResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
+            .WaitAndRetryAsync(
+                3,
+                retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: (outcome, timespan, retryAttempt, context) =>
+                {
+                    if (outcome.Exception != null)
+                    {
+                        Console.WriteLine("Retry {RetryAttempt} due to exception. Waiting {Delay}s before next attempt.",
+                            retryAttempt, timespan.TotalSeconds);
+                    }
+                    else
+                    {
+                        Console.WriteLine("Retry {RetryAttempt} due to unsuccessful response ({StatusCode}). Waiting {Delay}s before next attempt.",
+                            retryAttempt, outcome.Result?.StatusCode, timespan.TotalSeconds);
+                    }
+                });
 
+
+        
+        HttpResponseMessage response;
+
+        if (isDefaultHealthy)
+        {
+            response = await retryPolicy.ExecuteAsync(() =>
+                defaultClient.PostAsJsonAsync("/payments", new
+                {
+                    payment.CorrelationId,
+                    payment.Amount,
+                    RequestedAt = DateTime.UtcNow.ToString("o")
+                }));
+
+            usedClient = Constants.DefaultClient;
+            
+            // If still unsuccessful after retries, fallback
+            if (!response.IsSuccessStatusCode)
+            {
+                response = await retryPolicy.ExecuteAsync(() =>
+                    fallbackClient.PostAsJsonAsync("/payments", new
+                    {
+                        payment.CorrelationId,
+                        payment.Amount,
+                        RequestedAt = DateTime.UtcNow.ToString("o")
+                    }));
+                
+                usedClient = Constants.FallbackClient;
+            }
+        }
+        else
+        {
+            // Go directly to fallback client
+            response = await retryPolicy.ExecuteAsync(() =>
+                fallbackClient.PostAsJsonAsync("/payments", new
+                {
+                    payment.CorrelationId,
+                    payment.Amount,
+                    RequestedAt = DateTime.UtcNow.ToString("o")
+                }));
+            
+            usedClient = Constants.FallbackClient;
+        }
+
+        // var httpClient = isDefaultHealthy
+        //     ? httpClientFactory.CreateClient(Constants.DefaultClient)
+        //     : httpClientFactory.CreateClient(Constants.FallbackClient);
+        //
+        //
+        // var response = await retryPolicy.ExecuteAsync(() => defaultClient.PostAsJsonAsync("/payments", new
+        // {
+        //     payment.CorrelationId,
+        //     payment.Amount,
+        //     RequestedAt = DateTime.UtcNow.ToString("o")
+        // }));
         // var response = new HttpResponseMessage(HttpStatusCode.OK);
+        
         if (response.IsSuccessStatusCode)
         {
             var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, true);
             if (responses.TryRemove(payment.CorrelationId, out var tcs))
                 tcs.SetResult(paymentResponse);
 
-            if (GetClientExecutor(httpClient) == Constants.DefaultClient)
+            if (usedClient == Constants.DefaultClient)
             {
                 lock (paymentsDefault)
                     paymentsDefault.Add(paymentResponse);

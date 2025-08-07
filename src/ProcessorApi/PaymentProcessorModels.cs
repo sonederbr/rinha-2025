@@ -51,7 +51,8 @@ internal static class Constants
     internal const string HeaderClientSourceName = "X-Client-Source";
     internal const string DefaultClient = "DefaultUrl";
     internal const string FallbackClient = "FallbackUrl";
-    internal const ushort TimeoutInSeconds = 10;
+    internal const ushort HttpClientTimeoutInSeconds = 10;
     internal const ushort HealthCheckIntervalInSeconds = 5;
     internal const ushort QueueLimit = 1000;
+    internal const ushort HttpTimeoutInSeconds = 30;
 }
