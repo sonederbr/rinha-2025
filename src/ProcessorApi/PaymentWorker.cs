@@ -19,7 +19,7 @@ public class PaymentWorker(
         {
             try
             {
-                await processor.ProcessPaymentsAsync(
+                await processor.ProcessTransactionAsync(
                     payment,
                     responseDictionary,
                     defaultHealth,

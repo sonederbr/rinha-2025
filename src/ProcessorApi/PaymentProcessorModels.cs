@@ -1,12 +1,10 @@
 namespace ProcessorApi;
 
-public record PaymentRequest(string CorrelationId, decimal Amount);
+public abstract record PaymentRequest(string CorrelationId, decimal Amount, string RequestedAt);
 
-public record PaymentResponse(string CorrelationId, decimal Amount, bool Success);
+public record PaymentResponse(string CorrelationId, decimal Amount, DateTimeOffset RequestedAt, bool Success);
 
-record ServiceHealth(bool Failing, int MinResponseTime);
-
-record PaymentSummary(int TotalRequests = 0, decimal TotalAmount = 0.0m);
+record HealthStatus(bool Failing, int MinResponseTime);
 
 public class PaymentProcessorHealth
 {
@@ -41,18 +39,15 @@ public class PaymentProcessorHealth
         }
     }
 
-    public DateTime LastCheck { get; set; }
     public int MinResponseTime { get; set; }
 }
-
 
 internal static class Constants
 {
     internal const string HeaderClientSourceName = "X-Client-Source";
     internal const string DefaultClient = "DefaultUrl";
     internal const string FallbackClient = "FallbackUrl";
-    internal const ushort HttpClientTimeoutInSeconds = 10;
     internal const ushort HealthCheckIntervalInSeconds = 5;
     internal const ushort QueueLimit = 1000;
-    internal const ushort HttpTimeoutInSeconds = 30;
+    internal const ushort HttpTimeoutInSeconds = 45;
 }

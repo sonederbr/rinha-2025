@@ -1,129 +1,56 @@
 using System.Collections.Concurrent;
-using System.Net;
 using Polly;
+using Polly.Timeout;
+using Polly.Wrap;
 
 namespace ProcessorApi;
 
-public class PaymentProcessor(IHttpClientFactory httpClientFactory)
+public class PaymentProcessor
 {
-    internal async Task ProcessPaymentsAsync(
+    private readonly IHttpClientFactory _httpClientFactory;
+
+    private AsyncPolicyWrap<HttpResponseMessage>? _defaultPolicy;
+    private AsyncPolicy<HttpResponseMessage>? _fallbackPolicy;
+
+    public PaymentProcessor(IHttpClientFactory httpClientFactory)
+    {
+        _httpClientFactory = httpClientFactory;
+        ConfigureRetryPolices();
+    }
+
+    public async Task ProcessTransactionAsync(
         PaymentRequest payment,
-        ConcurrentDictionary<string, TaskCompletionSource<PaymentResponse>> responses,
+        ConcurrentDictionary<string, TaskCompletionSource<PaymentResponse>> responseDictionary,
         PaymentProcessorHealth defaultHealth,
         PaymentProcessorHealth fallbackHealth,
         List<PaymentResponse> paymentsDefault,
         List<PaymentResponse> paymentsFallback)
     {
-        var isDefaultHealthy = defaultHealth.IsHealthy;
-        var isFallbackHealthy = fallbackHealth.IsHealthy;
-        // Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
-        // if (!isDefaultHealthy && !isFallbackHealthy)
-        // {
-        //     await Task.Delay(2000);
-        //     isDefaultHealthy = defaultHealth.IsHealthy;
-        //     isFallbackHealthy = fallbackHealth.IsHealthy;
-        //     Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
-        //     if (!isDefaultHealthy && !isFallbackHealthy)
-        //     {
-        //         await Task.Delay(2000);
-        //         isDefaultHealthy = defaultHealth.IsHealthy;
-        //         isFallbackHealthy = fallbackHealth.IsHealthy;
-        //         Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
-        //         if (!isDefaultHealthy && !isFallbackHealthy)
-        //         {
-        //             await Task.Delay(1000);
-        //             isDefaultHealthy = defaultHealth.IsHealthy;
-        //             Console.WriteLine($"Default Health: {isDefaultHealthy}, Fallback Health: {isFallbackHealthy}");
-        //         }
-        //     }
-        // }
+        var payload = new
+        {
+            payment.CorrelationId,
+            payment.Amount,
+            payment.RequestedAt
+        };
 
         string usedClient;
-
-        var defaultClient = httpClientFactory.CreateClient(Constants.DefaultClient);
-        var fallbackClient = httpClientFactory.CreateClient(Constants.FallbackClient);
-        
-        var retryPolicy = Policy
-            .Handle<Exception>()
-            .OrResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
-            .WaitAndRetryAsync(
-                3,
-                retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
-                onRetry: (outcome, timespan, retryAttempt, context) =>
-                {
-                    if (outcome.Exception != null)
-                    {
-                        Console.WriteLine("Retry {RetryAttempt} due to exception. Waiting {Delay}s before next attempt.",
-                            retryAttempt, timespan.TotalSeconds);
-                    }
-                    else
-                    {
-                        Console.WriteLine("Retry {RetryAttempt} due to unsuccessful response ({StatusCode}). Waiting {Delay}s before next attempt.",
-                            retryAttempt, outcome.Result?.StatusCode, timespan.TotalSeconds);
-                    }
-                });
-
-
-        
-        HttpResponseMessage response;
-
-        if (isDefaultHealthy)
+        bool response;
+        if (ShouldUseFallback(defaultHealth, fallbackHealth))
         {
-            response = await retryPolicy.ExecuteAsync(() =>
-                defaultClient.PostAsJsonAsync("/payments", new
-                {
-                    payment.CorrelationId,
-                    payment.Amount,
-                    RequestedAt = DateTime.UtcNow.ToString("o")
-                }));
-
-            usedClient = Constants.DefaultClient;
-            
-            // If still unsuccessful after retries, fallback
-            if (!response.IsSuccessStatusCode)
-            {
-                response = await retryPolicy.ExecuteAsync(() =>
-                    fallbackClient.PostAsJsonAsync("/payments", new
-                    {
-                        payment.CorrelationId,
-                        payment.Amount,
-                        RequestedAt = DateTime.UtcNow.ToString("o")
-                    }));
-                
-                usedClient = Constants.FallbackClient;
-            }
+            response = await SendToFallbackAsync(payload);
+            usedClient = Constants.FallbackClient;
         }
         else
         {
-            // Go directly to fallback client
-            response = await retryPolicy.ExecuteAsync(() =>
-                fallbackClient.PostAsJsonAsync("/payments", new
-                {
-                    payment.CorrelationId,
-                    payment.Amount,
-                    RequestedAt = DateTime.UtcNow.ToString("o")
-                }));
-            
-            usedClient = Constants.FallbackClient;
+            response = await SendToDefaultAsync(payload);
+            usedClient = Constants.DefaultClient;
         }
 
-        // var httpClient = isDefaultHealthy
-        //     ? httpClientFactory.CreateClient(Constants.DefaultClient)
-        //     : httpClientFactory.CreateClient(Constants.FallbackClient);
-        //
-        //
-        // var response = await retryPolicy.ExecuteAsync(() => defaultClient.PostAsJsonAsync("/payments", new
-        // {
-        //     payment.CorrelationId,
-        //     payment.Amount,
-        //     RequestedAt = DateTime.UtcNow.ToString("o")
-        // }));
-        // var response = new HttpResponseMessage(HttpStatusCode.OK);
-        
-        if (response.IsSuccessStatusCode)
+        if (response)
         {
-            var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, true);
-            if (responses.TryRemove(payment.CorrelationId, out var tcs))
+            DateTimeOffset.TryParse(payload.RequestedAt, out var requestedAt);
+            var paymentResponse = new PaymentResponse(payment.CorrelationId, payment.Amount, requestedAt, true);
+            if (responseDictionary.TryRemove(paymentResponse.CorrelationId, out var tcs))
                 tcs.SetResult(paymentResponse);
 
             if (usedClient == Constants.DefaultClient)
@@ -138,15 +65,120 @@ public class PaymentProcessor(IHttpClientFactory httpClientFactory)
         }
         else
         {
-            if (responses.TryRemove(payment.CorrelationId, out var tcs))
-                tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, false));
+            if (responseDictionary.TryRemove(payment.CorrelationId, out var tcs))
+                tcs.SetResult(new PaymentResponse(payment.CorrelationId, payment.Amount, default, false));
         }
     }
 
-    private static string GetClientExecutor(HttpClient httpClient)
+    private async Task<bool> SendToDefaultAsync(object payload)
     {
-        return httpClient.DefaultRequestHeaders.TryGetValues(Constants.HeaderClientSourceName, out var values)
-            ? values.First()
-            : string.Empty;
+        try
+        {
+            var client = _httpClientFactory.CreateClient(Constants.DefaultClient);
+            var context = new Context
+            {
+                ["payload"] = payload
+            };
+            var response = await _defaultPolicy!.ExecuteAsync((_, ct) =>
+                client.PostAsJsonAsync("/payments", payload, ct), context, CancellationToken.None);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Send To Default error: " + ex.Message);
+            return false;
+        }
+    }
+
+    private async Task<bool> SendToFallbackAsync(object payload)
+    {
+        try
+        {
+            var client = _httpClientFactory.CreateClient(Constants.FallbackClient);
+            var context = new Context
+            {
+                ["payload"] = payload
+            };
+            var response = await _fallbackPolicy!.ExecuteAsync((_, ct) =>
+                client.PostAsJsonAsync("/payments", payload, ct), context, CancellationToken.None);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Send To Fallback error: " + ex.Message);
+            return false;
+        }
+    }
+
+    private static bool ShouldUseFallback(
+        PaymentProcessorHealth defaultHealth,
+        PaymentProcessorHealth fallbackHealth)
+    {
+        // Default is out, use fallback
+        if (!defaultHealth.IsHealthy)
+            return true;
+
+        // Default is ok, fallback is ok, and the default response time is high, use fallback
+        return fallbackHealth.IsHealthy && defaultHealth.MinResponseTime > (3 * fallbackHealth.MinResponseTime);
+    }
+
+    private void ConfigureRetryPolices()
+    {
+        // 1. Timeout Policy (3 s per try)
+        var timeoutPolicy = Policy.TimeoutAsync<HttpResponseMessage>(
+            TimeSpan.FromSeconds(1.5),
+            TimeoutStrategy.Pessimistic,
+            onTimeoutAsync: (_, timespan, _, _) =>
+            {
+                Console.WriteLine($"Timeout after {timespan.TotalSeconds}s.");
+                return Task.CompletedTask;
+            });
+
+        // 2. Fallback Policy (will try a fallback client)
+        var fallbackPolicy = Policy<HttpResponseMessage>
+            .Handle<Exception>()
+            .OrResult(r => !r.IsSuccessStatusCode)
+            .FallbackAsync(
+                fallbackAction: async (_, context, ct) =>
+                {
+                    Console.WriteLine("[Fallback] Triggered after default policy failure.");
+                    var fallbackClient = _httpClientFactory.CreateClient(Constants.FallbackClient);
+                    var fallbackResponse = await fallbackClient.PostAsJsonAsync("/payments", context["payload"], ct);
+                    return fallbackResponse;
+                },
+                onFallbackAsync: async (_, _) =>
+                {
+                    Console.WriteLine("[Fallback] Executing fallback logic.");
+                    await Task.CompletedTask;
+                });
+
+        // 3. Retry Policy (Default - 2 retries)
+        var defaultRetryPolicy = Policy<HttpResponseMessage>
+            .Handle<Exception>()
+            .OrResult(r => !r.IsSuccessStatusCode)
+            .WaitAndRetryAsync(2,
+                attempt => TimeSpan.FromSeconds(Math.Pow(1.5, attempt)),
+                onRetry: (outcome, timespan, retryAttempt, _) =>
+                {
+                    Console.WriteLine($"[Default] Retry {retryAttempt} after {timespan.TotalSeconds}s: " +
+                                      $"{outcome.Exception?.Message ?? outcome.Result?.ReasonPhrase}");
+                });
+
+        // 4. Wrap them (inner to outer): Timeout -> Retry -> Fallback
+        _defaultPolicy = fallbackPolicy.WrapAsync(defaultRetryPolicy.WrapAsync(timeoutPolicy));
+
+        // 5. Fallback-only Policy with Timeout & Retry (optional)
+        _fallbackPolicy = Policy.WrapAsync(
+            timeoutPolicy,
+            Policy<HttpResponseMessage>
+                .Handle<Exception>()
+                .OrResult(r => !r.IsSuccessStatusCode)
+                .WaitAndRetryAsync(2,
+                    attempt => TimeSpan.FromSeconds(Math.Pow(1.5, attempt)),
+                    onRetry: (outcome, timespan, retryAttempt, _) =>
+                    {
+                        Console.WriteLine($"[FallbackOnly] Retry {retryAttempt} after {timespan.TotalSeconds}s: " +
+                                          $"{outcome.Exception?.Message ?? outcome.Result?.ReasonPhrase}");
+                    }));
     }
 }

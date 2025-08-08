@@ -9,41 +9,22 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 const string paymentProcessorDefaultUrl = "http://localhost:8001";
 const string paymentProcessorFallbackUrl = "http://localhost:8002";
+
 builder.Services.AddHttpClient(Constants.DefaultClient, httpClient =>
     {
         httpClient.BaseAddress = new Uri(paymentProcessorDefaultUrl);
         httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.DefaultClient);
-        httpClient.Timeout = TimeSpan.FromSeconds(Constants.HttpClientTimeoutInSeconds);
+        httpClient.Timeout = Timeout.InfiniteTimeSpan;
     })
-    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-    {
-        SslOptions = new SslClientAuthenticationOptions
-        {
-            RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true
-        },
-        PooledConnectionLifetime = TimeSpan.FromMinutes(5), // Refresh stale connections
-        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-        MaxConnectionsPerServer = 100, // Increase if under high load
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-    });
+    .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler);
 
 builder.Services.AddHttpClient(Constants.FallbackClient, httpClient =>
     {
         httpClient.BaseAddress = new Uri(paymentProcessorFallbackUrl);
         httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.FallbackClient);
-        httpClient.Timeout = TimeSpan.FromSeconds(Constants.HttpClientTimeoutInSeconds);
+        httpClient.Timeout = Timeout.InfiniteTimeSpan;
     })
-    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-    {
-        SslOptions = new SslClientAuthenticationOptions
-        {
-            RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true
-        },
-        PooledConnectionLifetime = TimeSpan.FromMinutes(5), // Refresh stale connections
-        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-        MaxConnectionsPerServer = 100, // Increase if under high load
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-    });
+    .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler);
 
 var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOptions(Constants.QueueLimit)
 {
@@ -81,8 +62,6 @@ for (var i = 0; i < processorCount; i++)
         paymentsFallback));
 }
 
-// await paymentChannel.Writer.WriteAsync(new PaymentRequest(Guid.NewGuid().ToString(), 0.0m));
-
 var app = builder.Build();
 app.MapPost("/payments", async (PaymentRequest payment, CancellationToken cancellationToken = default) =>
 {
@@ -95,6 +74,7 @@ app.MapPost("/payments", async (PaymentRequest payment, CancellationToken cancel
     if (!await paymentChannel.Writer.WaitToWriteAsync(cancellationToken))
         return Results.InternalServerError("Service unavailable, queue is full.");
 
+    payment = payment with { RequestedAt = DateTime.UtcNow.ToString("o") };
     await paymentChannel.Writer.WriteAsync(payment, cancellationToken);
 
     var completedTask = await Task.WhenAny(tcs.Task,
@@ -111,16 +91,52 @@ app.MapPost("/payments", async (PaymentRequest payment, CancellationToken cancel
 
 app.MapGet("/payments-summary", (HttpRequest req) =>
 {
-    var from = req.Query["from"];
-    var to = req.Query["to"];
+    var fromStr = req.Query["from"].ToString();
+    var toStr = req.Query["to"].ToString();
 
-    return Task.FromResult(Results.Ok(new
+    DateTimeOffset? from = null;
+    DateTimeOffset? to = null;
+
+    if (DateTimeOffset.TryParse(fromStr, out var parsedFrom))
+        from = parsedFrom;
+
+    if (DateTimeOffset.TryParse(toStr, out var parsedTo))
+        to = parsedTo;
+
+    var filteredDefault = paymentsDefault
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
+
+    var filteredFallback = paymentsFallback
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
+
+    return Results.Ok(new
     {
-        Default = new PaymentSummary()
-            { TotalAmount = paymentsDefault.Sum(p => p.Amount), TotalRequests = paymentsDefault.Count() },
-        Fallback = new PaymentSummary()
-            { TotalAmount = paymentsFallback.Sum(p => p.Amount), TotalRequests = paymentsFallback.Count() }
-    }));
+        @default = new
+        {
+            totalRequests = filteredDefault.Count,
+            totalAmount = filteredDefault.Sum(p => p.Amount)
+        },
+        fallback = new
+        {
+            totalRequests = filteredFallback.Count,
+            totalAmount = filteredFallback.Sum(p => p.Amount)
+        }
+    });
 });
 
 app.Run();
+return;
+
+SocketsHttpHandler CreateHttpHandler() => new()
+{
+    SslOptions = new SslClientAuthenticationOptions
+    {
+        RemoteCertificateValidationCallback = (sender, cert, chain, errors) => true
+    },
+    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+    MaxConnectionsPerServer = 100,
+    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+};
