@@ -156,7 +156,7 @@ public class PaymentProcessor
         var defaultRetryPolicy = Policy<HttpResponseMessage>
             .Handle<Exception>()
             .OrResult(r => !r.IsSuccessStatusCode)
-            .WaitAndRetryAsync(2,
+            .WaitAndRetryAsync(1,
                 attempt => TimeSpan.FromSeconds(Math.Pow(1.5, attempt)),
                 onRetry: (outcome, timespan, retryAttempt, _) =>
                 {
@@ -173,7 +173,7 @@ public class PaymentProcessor
             Policy<HttpResponseMessage>
                 .Handle<Exception>()
                 .OrResult(r => !r.IsSuccessStatusCode)
-                .WaitAndRetryAsync(2,
+                .WaitAndRetryAsync(1,
                     attempt => TimeSpan.FromSeconds(Math.Pow(1.5, attempt)),
                     onRetry: (outcome, timespan, retryAttempt, _) =>
                     {

@@ -1,6 +1,6 @@
 namespace ProcessorApi;
 
-public abstract record PaymentRequest(string CorrelationId, decimal Amount, string RequestedAt);
+public record PaymentRequest(string CorrelationId, decimal Amount, string RequestedAt);
 
 public record PaymentResponse(string CorrelationId, decimal Amount, DateTimeOffset RequestedAt, bool Success);
 
@@ -48,6 +48,6 @@ internal static class Constants
     internal const string DefaultClient = "DefaultUrl";
     internal const string FallbackClient = "FallbackUrl";
     internal const ushort HealthCheckIntervalInSeconds = 5;
-    internal const ushort QueueLimit = 1000;
+    internal const ushort QueueLimit = 10000;
     internal const ushort HttpTimeoutInSeconds = 45;
 }

@@ -30,7 +30,7 @@ var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOpt
 {
     SingleReader = false, // Allow multiple readers
     SingleWriter = true, // Optimize for a single writer
-    FullMode = BoundedChannelFullMode.Wait // Wait when the channel is full
+    FullMode = BoundedChannelFullMode.DropOldest // Wait when the channel is full
 });
 var responseDictionary = new ConcurrentDictionary<string, TaskCompletionSource<PaymentResponse>>();
 var defaultProcessorHealth = new PaymentProcessorHealth();
@@ -48,8 +48,8 @@ builder.Services.AddHostedService<HealthCheckWorker>(provider => new HealthCheck
     fallbackProcessorHealth,
     TimeSpan.FromSeconds(Constants.HealthCheckIntervalInSeconds)));
 
-ThreadPool.SetMinThreads(Environment.ProcessorCount * 4, Environment.ProcessorCount * 4);
-var processorCount = Environment.ProcessorCount * 4;
+ThreadPool.SetMinThreads(Environment.ProcessorCount * 10, Environment.ProcessorCount * 10);
+var processorCount = Environment.ProcessorCount * 10;
 for (var i = 0; i < processorCount; i++)
 {
     builder.Services.AddHostedService<PaymentWorker>(provider => new PaymentWorker(
@@ -133,10 +133,11 @@ SocketsHttpHandler CreateHttpHandler() => new()
 {
     SslOptions = new SslClientAuthenticationOptions
     {
-        RemoteCertificateValidationCallback = (sender, cert, chain, errors) => true
+        RemoteCertificateValidationCallback = (_, _, _, _) => true
     },
     PooledConnectionLifetime = TimeSpan.FromMinutes(5),
     PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-    MaxConnectionsPerServer = 100,
+    MaxConnectionsPerServer = 500,
     AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
 };
+// dotnet run --project ProcessorApi.csproj --no-restore --Environment=Production--ServerSettings:Port=9999
