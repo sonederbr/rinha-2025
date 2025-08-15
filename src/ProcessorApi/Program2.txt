@@ -1,8 +1,6 @@
 using System.Net;
 using System.Net.Security;
-using System.Text.Json;
 using System.Threading.Channels;
-using Microsoft.AspNetCore.Http.Json;
 using Polly;
 using Polly.Timeout;
 using Polly.Wrap;
@@ -12,7 +10,6 @@ var builder = WebApplication.CreateBuilder(args);
 const string paymentProcessorDefaultUrl = "http://localhost:8001";
 const string paymentProcessorFallbackUrl = "http://localhost:8002";
 
-const string paymentStoreUrl = "http://localhost:9996";
 
 ThreadPool.SetMinThreads(workerThreads: 512, completionPortThreads: 512);
 
@@ -54,15 +51,6 @@ builder.Services.AddHttpClient(Constants.FallbackClient, httpClient =>
     .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler)
     .SetHandlerLifetime(TimeSpan.FromMinutes(5));
 
-builder.Services.AddHttpClient(Constants.StoreClient, httpClient =>
-    {
-        httpClient.BaseAddress = new Uri(paymentStoreUrl);
-        httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.StoreClient);
-        httpClient.Timeout = Timeout.InfiniteTimeSpan;
-    })
-    .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler)
-    .SetHandlerLifetime(TimeSpan.FromMinutes(5));
-
 var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOptions(2048)
 {
     SingleReader = false,
@@ -71,8 +59,8 @@ var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOpt
 });
 var defaultProcessorHealth = new PaymentProcessorHealth();
 var fallbackProcessorHealth = new PaymentProcessorHealth();
-// var paymentsDefault = new List<PaymentResponse>();
-// var paymentsFallback = new List<PaymentResponse>();
+var paymentsDefault = new List<PaymentResponse>();
+var paymentsFallback = new List<PaymentResponse>();
 
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<PaymentProcessor>(provider => new PaymentProcessor(
@@ -92,7 +80,9 @@ for (var i = 0; i < processorCount; i++)
 {
     builder.Services.AddHostedService<PaymentWorker>(provider => new PaymentWorker(
         paymentChannel,
-        provider.GetRequiredService<PaymentProcessor>()));
+        provider.GetRequiredService<PaymentProcessor>(),
+        paymentsDefault,
+        paymentsFallback));
 }
 
 var app = builder.Build();
@@ -109,29 +99,27 @@ app.MapPost("/payments", (PaymentRequest payment) =>
         new { Message = "Payment accepted for processing." });
 });
 
-app.MapGet("/payments-summary", async (HttpRequest req, PaymentProcessor paymentProcessor) =>
+app.MapGet("/payments-summary", (HttpRequest req) =>
 {
     var fromStr = req.Query["from"].ToString();
     var toStr = req.Query["to"].ToString();
 
-    // DateTimeOffset? from = null;
-    // DateTimeOffset? to = null;
-    //
-    // if (DateTimeOffset.TryParse(fromStr, out var parsedFrom))
-    //     from = parsedFrom;
-    //
-    // if (DateTimeOffset.TryParse(toStr, out var parsedTo))
-    //     to = parsedTo;
+    DateTimeOffset? from = null;
+    DateTimeOffset? to = null;
 
-    var filteredDefault = await paymentProcessor.GetFromStore(true, fromStr, toStr);
-    // var filteredDefault = paymentsDefault
-    //     .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
-    //     .ToList();
+    if (DateTimeOffset.TryParse(fromStr, out var parsedFrom))
+        from = parsedFrom;
 
-    var filteredFallback = await paymentProcessor.GetFromStore(false, fromStr, toStr);
-    // var filteredFallback = paymentsFallback
-    //     .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
-    //     .ToList();
+    if (DateTimeOffset.TryParse(toStr, out var parsedTo))
+        to = parsedTo;
+
+    var filteredDefault = paymentsDefault
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
+
+    var filteredFallback = paymentsFallback
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
 
     return Results.Ok(new
     {
@@ -160,12 +148,6 @@ public class PaymentProcessor
     private AsyncPolicy<HttpResponseMessage>? _fallbackPolicy;
     private readonly PaymentProcessorHealth _defaultHealth;
     private readonly PaymentProcessorHealth _fallbackHealth;
-    
-    private static readonly JsonSerializerOptions StjOptions = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
-
 
     public PaymentProcessor(IHttpClientFactory httpClientFactory, PaymentProcessorHealth defaultHealth, PaymentProcessorHealth fallbackHealth)
     {
@@ -177,7 +159,8 @@ public class PaymentProcessor
 
     public async Task ProcessTransactionAsync(
         PaymentRequest payment,
-        Channel<PaymentRequest> paymentChannel,
+        List<PaymentResponse> paymentsDefault,
+        List<PaymentResponse> paymentsFallback,
         CancellationToken cancellationToken)
     {
         var requestedAt = DateTime.UtcNow;
@@ -193,61 +176,20 @@ public class PaymentProcessor
         {
             case Constants.DefaultClient:
             {
-                // lock (paymentsDefault) paymentsDefault.Add(paymentResponse);
-                _ = SendToStore(paymentResponse, true, cancellationToken);
+                lock (paymentsDefault) paymentsDefault.Add(paymentResponse);
                 break;
             }
             case Constants.FallbackClient:
             {
-                // lock (paymentsFallback) paymentsFallback.Add(paymentResponse);
-                _ = SendToStore(paymentResponse, false, cancellationToken);
+                lock (paymentsFallback) paymentsFallback.Add(paymentResponse);
                 break;
             }
         }
-
-        if (!response)
-        {
-            Console.WriteLine(paymentChannel.Writer.TryWrite(payment)
-                ? $"Re-queued payment {payment.CorrelationId}"
-                : $"Failed to requeue payment {payment.CorrelationId}: Queue full");
-        }
-    }
-
-    private async Task SendToStore(PaymentResponse paymentResponse, bool isDefault, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var client = GetClient(Constants.StoreClient);
-            var endpoint = isDefault ? "/default-summary" : "/fallback-summary";
-            await client.PostAsJsonAsync(endpoint, paymentResponse, cancellationToken);
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-        }
-    }
-    
-
-    public async Task<List<PaymentResponse>> GetFromStore(bool isDefault, string fromStr, string toStr, CancellationToken cancellationToken = default)
-    {
-        var endpoint = isDefault ? "/default-summary" : "/fallback-summary";
-        try
-        {
-            var client = GetClient(Constants.StoreClient);
-            var uri = $"{endpoint}?from={Uri.EscapeDataString(fromStr)}&to={Uri.EscapeDataString(toStr)}";
         
-            var items = await client.GetFromJsonAsync<List<PaymentResponse>>(
-                uri, StjOptions, cancellationToken);
-        
-            Console.WriteLine($"{uri} > {items?.Count ?? 0} items retrieved");
-            return items ?? new List<PaymentResponse>();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"Error retrieving payments from {endpoint}: {e.Message}");
-            return new List<PaymentResponse>();
-        }
+        if(!response)
+            Console.WriteLine("Transaction has not been processed.");
     }
+
     private async Task<(bool response, string usedClient)> SendTransaction(object payload, CancellationToken cancellationToken)
     {
         try
@@ -258,7 +200,7 @@ public class PaymentProcessor
         }
         catch (Exception e)
         {
-            Console.WriteLine("SendTransaction error: " + e.Message);
+            Console.WriteLine("SendTransaction: " + e.Message);
         }
         return (false, string.Empty);
     }
@@ -363,12 +305,17 @@ public class PaymentProcessor
         return false;
     }
 
-    private HttpClient GetClient(string clientName) => _httpClientFactory.CreateClient(clientName);
+    private HttpClient GetClient(string clientName)
+    {
+        return _httpClientFactory.CreateClient(clientName);
+    }
 }
 
 public class PaymentWorker(
     Channel<PaymentRequest> channel,
-    PaymentProcessor processor)
+    PaymentProcessor processor,
+    List<PaymentResponse> paymentsDefault,
+    List<PaymentResponse> paymentsFallback)
     : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken cancellationToken)
@@ -390,7 +337,8 @@ public class PaymentWorker(
     {
         await processor.ProcessTransactionAsync(
             payment,
-            channel,
+            paymentsDefault,
+            paymentsFallback,
             cancellationToken);
     }
 }
@@ -503,6 +451,8 @@ public class PaymentProcessorHealth
             }
         }
     }
+
+    public bool IsBreakerOpen { get; set; }
     public int MinResponseTime { get; set; }
 }
 
@@ -511,8 +461,9 @@ internal static class Constants
     internal const string HeaderClientSourceName = "X-Client-Source";
     internal const string DefaultClient = "DefaultUrl";
     internal const string FallbackClient = "FallbackUrl";
-    internal const string StoreClient = "StoreUrl";
     internal const ushort HealthCheckIntervalInSeconds = 5;
+    internal const ushort QueueLimit = 1024;
+    internal const ushort HttpTimeoutInSeconds = 45;
 }
 
 #endregion

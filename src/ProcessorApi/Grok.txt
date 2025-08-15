@@ -1,18 +1,24 @@
+using System;
+using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Http.Json;
 using System.Net.Security;
-using System.Text.Json;
+using System.Threading;
 using System.Threading.Channels;
-using Microsoft.AspNetCore.Http.Json;
+using System.Threading.Tasks;
 using Polly;
+using Polly.CircuitBreaker;
 using Polly.Timeout;
 using Polly.Wrap;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using System.Collections.Generic;
 
 var builder = WebApplication.CreateBuilder(args);
 
 const string paymentProcessorDefaultUrl = "http://localhost:8001";
 const string paymentProcessorFallbackUrl = "http://localhost:8002";
-
-const string paymentStoreUrl = "http://localhost:9996";
 
 ThreadPool.SetMinThreads(workerThreads: 512, completionPortThreads: 512);
 
@@ -23,7 +29,6 @@ builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxRequestLineSize = 8192;
 });
 
-
 SocketsHttpHandler CreateHttpHandler() => new()
 {
     SslOptions = new SslClientAuthenticationOptions
@@ -32,7 +37,7 @@ SocketsHttpHandler CreateHttpHandler() => new()
     },
     PooledConnectionLifetime = TimeSpan.FromMinutes(5),
     PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-    MaxConnectionsPerServer = 1024,
+    MaxConnectionsPerServer = 512, // Reduzido para evitar sufocamento
     AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
 };
 
@@ -54,15 +59,6 @@ builder.Services.AddHttpClient(Constants.FallbackClient, httpClient =>
     .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler)
     .SetHandlerLifetime(TimeSpan.FromMinutes(5));
 
-builder.Services.AddHttpClient(Constants.StoreClient, httpClient =>
-    {
-        httpClient.BaseAddress = new Uri(paymentStoreUrl);
-        httpClient.DefaultRequestHeaders.Add(Constants.HeaderClientSourceName, Constants.StoreClient);
-        httpClient.Timeout = Timeout.InfiniteTimeSpan;
-    })
-    .ConfigurePrimaryHttpMessageHandler(CreateHttpHandler)
-    .SetHandlerLifetime(TimeSpan.FromMinutes(5));
-
 var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOptions(2048)
 {
     SingleReader = false,
@@ -71,8 +67,8 @@ var paymentChannel = Channel.CreateBounded<PaymentRequest>(new BoundedChannelOpt
 });
 var defaultProcessorHealth = new PaymentProcessorHealth();
 var fallbackProcessorHealth = new PaymentProcessorHealth();
-// var paymentsDefault = new List<PaymentResponse>();
-// var paymentsFallback = new List<PaymentResponse>();
+var paymentsDefault = new ConcurrentBag<PaymentResponse>(); // Alterado para ConcurrentBag
+var paymentsFallback = new ConcurrentBag<PaymentResponse>(); // Alterado para ConcurrentBag
 
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<PaymentProcessor>(provider => new PaymentProcessor(
@@ -92,7 +88,9 @@ for (var i = 0; i < processorCount; i++)
 {
     builder.Services.AddHostedService<PaymentWorker>(provider => new PaymentWorker(
         paymentChannel,
-        provider.GetRequiredService<PaymentProcessor>()));
+        provider.GetRequiredService<PaymentProcessor>(),
+        paymentsDefault,
+        paymentsFallback));
 }
 
 var app = builder.Build();
@@ -109,29 +107,27 @@ app.MapPost("/payments", (PaymentRequest payment) =>
         new { Message = "Payment accepted for processing." });
 });
 
-app.MapGet("/payments-summary", async (HttpRequest req, PaymentProcessor paymentProcessor) =>
+app.MapGet("/payments-summary", (HttpRequest req) =>
 {
     var fromStr = req.Query["from"].ToString();
     var toStr = req.Query["to"].ToString();
 
-    // DateTimeOffset? from = null;
-    // DateTimeOffset? to = null;
-    //
-    // if (DateTimeOffset.TryParse(fromStr, out var parsedFrom))
-    //     from = parsedFrom;
-    //
-    // if (DateTimeOffset.TryParse(toStr, out var parsedTo))
-    //     to = parsedTo;
+    DateTimeOffset? from = null;
+    DateTimeOffset? to = null;
 
-    var filteredDefault = await paymentProcessor.GetFromStore(true, fromStr, toStr);
-    // var filteredDefault = paymentsDefault
-    //     .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
-    //     .ToList();
+    if (DateTimeOffset.TryParse(fromStr, out var parsedFrom))
+        from = parsedFrom;
 
-    var filteredFallback = await paymentProcessor.GetFromStore(false, fromStr, toStr);
-    // var filteredFallback = paymentsFallback
-    //     .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
-    //     .ToList();
+    if (DateTimeOffset.TryParse(toStr, out var parsedTo))
+        to = parsedTo;
+
+    var filteredDefault = paymentsDefault
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
+
+    var filteredFallback = paymentsFallback
+        .Where(p => (!from.HasValue || p.RequestedAt >= from) && (!to.HasValue || p.RequestedAt <= to))
+        .ToList();
 
     return Results.Ok(new
     {
@@ -155,17 +151,10 @@ app.Run();
 public class PaymentProcessor
 {
     private readonly IHttpClientFactory _httpClientFactory;
-
     private AsyncPolicyWrap<HttpResponseMessage>? _defaultPolicy;
     private AsyncPolicy<HttpResponseMessage>? _fallbackPolicy;
     private readonly PaymentProcessorHealth _defaultHealth;
     private readonly PaymentProcessorHealth _fallbackHealth;
-    
-    private static readonly JsonSerializerOptions StjOptions = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
-
 
     public PaymentProcessor(IHttpClientFactory httpClientFactory, PaymentProcessorHealth defaultHealth, PaymentProcessorHealth fallbackHealth)
     {
@@ -177,6 +166,8 @@ public class PaymentProcessor
 
     public async Task ProcessTransactionAsync(
         PaymentRequest payment,
+        ConcurrentBag<PaymentResponse> paymentsDefault,
+        ConcurrentBag<PaymentResponse> paymentsFallback,
         Channel<PaymentRequest> paymentChannel,
         CancellationToken cancellationToken)
     {
@@ -188,66 +179,37 @@ public class PaymentProcessor
             RequestedAt = requestedAt.ToString("o")
         };
         var (response, usedClient) = await SendTransaction(payload, cancellationToken);
-        var paymentResponse = new PaymentResponse(payment.Amount, requestedAt);
-        switch (usedClient)
+        if (response)
         {
-            case Constants.DefaultClient:
+            var paymentResponse = new PaymentResponse(payment.Amount, requestedAt);
+            switch (usedClient)
             {
-                // lock (paymentsDefault) paymentsDefault.Add(paymentResponse);
-                _ = SendToStore(paymentResponse, true, cancellationToken);
-                break;
-            }
-            case Constants.FallbackClient:
-            {
-                // lock (paymentsFallback) paymentsFallback.Add(paymentResponse);
-                _ = SendToStore(paymentResponse, false, cancellationToken);
-                break;
+                case Constants.DefaultClient:
+                    paymentsDefault.Add(paymentResponse);
+                    break;
+                case Constants.FallbackClient:
+                    paymentsFallback.Add(paymentResponse);
+                    break;
             }
         }
-
-        if (!response)
+        else if (payment.RetryCount < 5) // Reenfileira até 5 tentativas
         {
-            Console.WriteLine(paymentChannel.Writer.TryWrite(payment)
-                ? $"Re-queued payment {payment.CorrelationId}"
-                : $"Failed to requeue payment {payment.CorrelationId}: Queue full");
+            payment.RetryCount++;
+            if (paymentChannel.Writer.TryWrite(payment))
+            {
+                Console.WriteLine($"Requeued payment {payment.CorrelationId} (Retry {payment.RetryCount})");
+            }
+            else
+            {
+                Console.WriteLine($"Failed to requeue payment {payment.CorrelationId}: Queue full");
+            }
+        }
+        else
+        {
+            Console.WriteLine($"Payment {payment.CorrelationId} failed after {payment.RetryCount} retries");
         }
     }
 
-    private async Task SendToStore(PaymentResponse paymentResponse, bool isDefault, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var client = GetClient(Constants.StoreClient);
-            var endpoint = isDefault ? "/default-summary" : "/fallback-summary";
-            await client.PostAsJsonAsync(endpoint, paymentResponse, cancellationToken);
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-        }
-    }
-    
-
-    public async Task<List<PaymentResponse>> GetFromStore(bool isDefault, string fromStr, string toStr, CancellationToken cancellationToken = default)
-    {
-        var endpoint = isDefault ? "/default-summary" : "/fallback-summary";
-        try
-        {
-            var client = GetClient(Constants.StoreClient);
-            var uri = $"{endpoint}?from={Uri.EscapeDataString(fromStr)}&to={Uri.EscapeDataString(toStr)}";
-        
-            var items = await client.GetFromJsonAsync<List<PaymentResponse>>(
-                uri, StjOptions, cancellationToken);
-        
-            Console.WriteLine($"{uri} > {items?.Count ?? 0} items retrieved");
-            return items ?? new List<PaymentResponse>();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"Error retrieving payments from {endpoint}: {e.Message}");
-            return new List<PaymentResponse>();
-        }
-    }
     private async Task<(bool response, string usedClient)> SendTransaction(object payload, CancellationToken cancellationToken)
     {
         try
@@ -258,7 +220,7 @@ public class PaymentProcessor
         }
         catch (Exception e)
         {
-            Console.WriteLine("SendTransaction error: " + e.Message);
+            Console.WriteLine("SendTransaction: " + e.Message);
         }
         return (false, string.Empty);
     }
@@ -270,7 +232,7 @@ public class PaymentProcessor
         var context = new Context { ["payload"] = payload, ["LastPolicy"] = Constants.DefaultClient };
         var response = await _defaultPolicy!.ExecuteAsync((_, ct) =>
             client.PostAsJsonAsync("/payments", payload, ct), context, cancellationToken);
-        var usedPolicy = context.TryGetValue("LastPolicy", out var value) ? value.ToString() : "Unknow";
+        var usedPolicy = context.TryGetValue("LastPolicy", out var value) ? value.ToString() : "Unknown";
         if (!usedPolicy!.Equals(Constants.DefaultClient))
             Console.WriteLine(
                 $"Send to: {Constants.DefaultClient} executed on {usedPolicy} and is {response.IsSuccessStatusCode}");
@@ -284,7 +246,7 @@ public class PaymentProcessor
         var context = new Context { ["payload"] = payload, ["LastPolicy"] = Constants.FallbackClient };
         var response = await _fallbackPolicy!.ExecuteAsync((_, ct) =>
             client.PostAsJsonAsync("/payments", payload, ct), context, cancellationToken);
-        var usedPolicy = context.TryGetValue("LastPolicy", out var value) ? value.ToString() : "Unknow";
+        var usedPolicy = context.TryGetValue("LastPolicy", out var value) ? value.ToString() : "Unknown";
         if (!usedPolicy!.Equals(Constants.FallbackClient))
             Console.WriteLine(
                 $"Send to: {Constants.FallbackClient} executed on {usedPolicy} and is {response.IsSuccessStatusCode}");
@@ -293,30 +255,48 @@ public class PaymentProcessor
 
     private void ConfigureRetryPolices()
     {
-        int defaultRetries = 2; 
-        double defaultTimeoutSeconds = 3.5; 
-        double defaultSleepBase = 2;
-
-        int fallbackRetries = 2; 
-        double fallbackTimeoutSeconds = 2;
-        double fallbackSleepBase = 2;
+        int defaultRetries = 5; // Aumentado para 5
+        int fallbackRetries = 5; // Aumentado para 5
+        double toleranceFactor = 1.5; // Mantido
 
         var defaultTimeout = Policy.TimeoutAsync<HttpResponseMessage>(
-            TimeSpan.FromSeconds(defaultTimeoutSeconds),
+            TimeSpan.FromSeconds(Math.Max(3.5, _defaultHealth.MinResponseTime / 1000.0 * toleranceFactor)),
             TimeoutStrategy.Optimistic
         );
 
         var fallbackTimeout = Policy.TimeoutAsync<HttpResponseMessage>(
-            TimeSpan.FromSeconds(fallbackTimeoutSeconds),
+            TimeSpan.FromSeconds(Math.Max(2.0, _fallbackHealth.MinResponseTime / 1000.0 * toleranceFactor)),
             TimeoutStrategy.Optimistic
         );
+
+        var defaultCircuitBreaker = Policy<HttpResponseMessage>
+            .Handle<Exception>()
+            .OrResult(r => !r.IsSuccessStatusCode)
+            .CircuitBreakerAsync(
+                exceptionsAllowedBeforeBreaking: 3,
+                durationOfBreak: TimeSpan.FromSeconds(30),
+                onBreak: (result, breakDuration, context) =>
+                    Console.WriteLine($"Default circuit breaker opened for {breakDuration.TotalSeconds}s"),
+                onReset: () => Console.WriteLine("Default circuit breaker reset")
+            );
+
+        var fallbackCircuitBreaker = Policy<HttpResponseMessage>
+            .Handle<Exception>()
+            .OrResult(r => !r.IsSuccessStatusCode)
+            .CircuitBreakerAsync(
+                exceptionsAllowedBeforeBreaking: 3,
+                durationOfBreak: TimeSpan.FromSeconds(30),
+                onBreak: (result, breakDuration, context) =>
+                    Console.WriteLine($"Fallback circuit breaker opened for {breakDuration.TotalSeconds}s"),
+                onReset: () => Console.WriteLine("Fallback circuit breaker reset")
+            );
 
         var defaultRetryPolicy = Policy<HttpResponseMessage>
             .Handle<Exception>()
             .OrResult(r => !r.IsSuccessStatusCode)
             .WaitAndRetryAsync(
                 retryCount: defaultRetries,
-                sleepDurationProvider: attempt => TimeSpan.FromSeconds(defaultSleepBase * attempt),
+                sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt) + Random.Shared.NextDouble()),
                 onRetryAsync: async (_, _, _, context) =>
                 {
                     context["LastPolicy"] = Constants.DefaultClient;
@@ -329,46 +309,60 @@ public class PaymentProcessor
             .OrResult(r => !r.IsSuccessStatusCode)
             .WaitAndRetryAsync(
                 retryCount: fallbackRetries,
-                sleepDurationProvider: attempt => TimeSpan.FromSeconds(fallbackSleepBase * attempt),
+                sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt) + Random.Shared.NextDouble()),
                 onRetryAsync: async (_, _, _, context) =>
                 {
                     context["LastPolicy"] = Constants.FallbackClient;
                     await Task.CompletedTask;
                 }
             );
-        
-        var defaultWithTimeout = defaultRetryPolicy.WrapAsync(defaultTimeout);
-        var fallbackWithTimeout = fallbackRetryPolicy.WrapAsync(fallbackTimeout);
-        
+
+        var defaultBulkhead = Policy.BulkheadAsync<HttpResponseMessage>(512, int.MaxValue); // Limita concorrência
+        var fallbackBulkhead = Policy.BulkheadAsync<HttpResponseMessage>(512, int.MaxValue);
+
+        var defaultWithTimeout = defaultRetryPolicy.WrapAsync(defaultTimeout).WrapAsync(defaultCircuitBreaker).WrapAsync(defaultBulkhead);
+        var fallbackWithTimeout = fallbackRetryPolicy.WrapAsync(fallbackTimeout).WrapAsync(fallbackCircuitBreaker).WrapAsync(fallbackBulkhead);
+
         var defaultWithFallback = defaultWithTimeout.WrapAsync(fallbackWithTimeout);
         var fallbackWithDefault = fallbackWithTimeout.WrapAsync(defaultWithTimeout);
 
         _defaultPolicy = defaultWithFallback.WrapAsync(fallbackWithDefault);
         _fallbackPolicy = fallbackWithDefault.WrapAsync(defaultWithFallback);
     }
-    
+
     private bool ShouldUseFallback()
     {
-        if (!_defaultHealth.IsHealthy)
+        if (!_defaultHealth.IsHealthy && _fallbackHealth.IsHealthy)
             return true;
-        
-        if (!_fallbackHealth.IsHealthy)
+
+        if (!_fallbackHealth.IsHealthy && _defaultHealth.IsHealthy)
             return false;
-        
+
+        if (!_defaultHealth.IsHealthy && !_fallbackHealth.IsHealthy)
+        {
+            // Ambos offline: tenta o com menor tempo de resposta
+            return _fallbackHealth.MinResponseTime < _defaultHealth.MinResponseTime;
+        }
+
         var toleranceFactor = 1.5;
-        if ((_defaultHealth.IsHealthy && _fallbackHealth.IsHealthy) && _defaultHealth.MinResponseTime >
-            (int)(toleranceFactor * _fallbackHealth.MinResponseTime))
+        if (_defaultHealth.IsHealthy && _fallbackHealth.IsHealthy && 
+            _defaultHealth.MinResponseTime > (int)(toleranceFactor * _fallbackHealth.MinResponseTime))
             return true;
 
         return false;
     }
 
-    private HttpClient GetClient(string clientName) => _httpClientFactory.CreateClient(clientName);
+    private HttpClient GetClient(string clientName)
+    {
+        return _httpClientFactory.CreateClient(clientName);
+    }
 }
 
 public class PaymentWorker(
     Channel<PaymentRequest> channel,
-    PaymentProcessor processor)
+    PaymentProcessor processor,
+    ConcurrentBag<PaymentResponse> paymentsDefault,
+    ConcurrentBag<PaymentResponse> paymentsFallback)
     : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken cancellationToken)
@@ -377,11 +371,11 @@ public class PaymentWorker(
         {
             try
             {
-                _ = ProcessPaymentAsync(payment, cancellationToken);
+                await ProcessPaymentAsync(payment, cancellationToken);
             }
             catch
             {
-                // ignored
+                // Ignored, reenfileiramento tratado em ProcessTransactionAsync
             }
         }
     }
@@ -390,7 +384,9 @@ public class PaymentWorker(
     {
         await processor.ProcessTransactionAsync(
             payment,
-            channel,
+            paymentsDefault,
+            paymentsFallback,
+            channel, // Passa o channel para reenfileiramento
             cancellationToken);
     }
 }
@@ -423,10 +419,10 @@ public class HealthCheckWorker(
             }
             catch
             {
-                // ignored
+                // Ignored
             }
 
-            await Task.Delay(interval, cancellationToken);
+            await Task.Delay(interval + TimeSpan.FromMilliseconds(Random.Shared.Next(1000)), cancellationToken); // Jitter
         }
     }
 }
@@ -441,7 +437,7 @@ public class HealthCheckProcessor(IHttpClientFactory httpClientFactory)
         try
         {
             var httpClient = httpClientFactory.CreateClient(client);
-            httpClient.Timeout = TimeSpan.FromSeconds(2);
+            httpClient.Timeout = TimeSpan.FromSeconds(Math.Max(2, health.MinResponseTime / 1000.0 * 1.5)); // Timeout dinâmico
             var response = await httpClient.GetFromJsonAsync<HealthStatus>(
                 "payments/service-health",
                 cancellationToken: cancellationToken);
@@ -464,8 +460,7 @@ public class HealthCheckProcessor(IHttpClientFactory httpClientFactory)
 
 #region Models
 
-// ReSharper disable once ClassNeverInstantiated.Global
-public record PaymentRequest(string CorrelationId, decimal Amount);
+public record PaymentRequest(string CorrelationId, decimal Amount, int RetryCount = 0); // Adicionado RetryCount
 
 public record PaymentResponse(decimal Amount, DateTimeOffset RequestedAt);
 
@@ -503,6 +498,8 @@ public class PaymentProcessorHealth
             }
         }
     }
+
+    public bool IsBreakerOpen { get; set; }
     public int MinResponseTime { get; set; }
 }
 
@@ -511,8 +508,9 @@ internal static class Constants
     internal const string HeaderClientSourceName = "X-Client-Source";
     internal const string DefaultClient = "DefaultUrl";
     internal const string FallbackClient = "FallbackUrl";
-    internal const string StoreClient = "StoreUrl";
     internal const ushort HealthCheckIntervalInSeconds = 5;
+    internal const ushort QueueLimit = 1024;
+    internal const ushort HttpTimeoutInSeconds = 45;
 }
 
 #endregion
